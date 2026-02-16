@@ -265,4 +265,18 @@ public:
     float surfaceHeight(int i, int j) const { return B[idx(i,j)] + h[idx(i,j)]; }
     float waterDepth   (int i, int j) const { return h[idx(i,j)]; }
     float bottomHeight (int i, int j) const { return B[idx(i,j)]; }
+
+    // Velocity components (safe against dry cells)
+    float velocityX(int i, int j) const {
+        int id = idx(i,j);
+        return (h[id] > 0.01f) ? hu[id] / h[id] : 0.f;
+    }
+    float velocityZ(int i, int j) const {
+        int id = idx(i,j);
+        return (h[id] > 0.01f) ? hv[id] / h[id] : 0.f;
+    }
+    float speed(int i, int j) const {
+        float vx = velocityX(i,j), vz = velocityZ(i,j);
+        return std::sqrt(vx*vx + vz*vz);
+    }
 };

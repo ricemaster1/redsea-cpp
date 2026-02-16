@@ -40,23 +40,26 @@
 // ---- Water surface ---------------------------------------------------------
 static const char* waterVertSrc = R"(
 #version 330 core
-layout(location = 0) in vec3 aPos;
-layout(location = 1) in vec3 aNormal;
+layout(location = 0) in vec3  aPos;
+layout(location = 1) in vec3  aNormal;
 layout(location = 2) in float aDepth;
+layout(location = 3) in vec2  aVelocity;
 
 uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
 
-out vec3 FragPos;
-out vec3 Normal;
+out vec3  FragPos;
+out vec3  Normal;
 out float WaterDepth;
+out vec2  Velocity;
 
 void main() {
     vec4 wp  = model * vec4(aPos, 1.0);
     FragPos  = wp.xyz;
     Normal   = mat3(transpose(inverse(model))) * aNormal;
     WaterDepth = aDepth;
+    Velocity   = aVelocity;
     gl_Position = projection * view * wp;
 }
 )";
@@ -66,42 +69,121 @@ static const char* waterFragSrc = R"(
 in vec3  FragPos;
 in vec3  Normal;
 in float WaterDepth;
+in vec2  Velocity;
 
 out vec4 FragColor;
 
-uniform vec3 lightDir;
-uniform vec3 viewPos;
+uniform vec3  lightDir;
+uniform vec3  viewPos;
+uniform float uTime;
+
+// ---- Procedural noise (hash-based) ----------------------------------------
+vec2 hash22(vec2 p) {
+    p = vec2(dot(p, vec2(127.1, 311.7)),
+             dot(p, vec2(269.5, 183.3)));
+    return -1.0 + 2.0 * fract(sin(p) * 43758.5453);
+}
+float gnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(dot(hash22(i + vec2(0,0)), f - vec2(0,0)),
+                   dot(hash22(i + vec2(1,0)), f - vec2(1,0)), u.x),
+               mix(dot(hash22(i + vec2(0,1)), f - vec2(0,1)),
+                   dot(hash22(i + vec2(1,1)), f - vec2(1,1)), u.x), u.y);
+}
+float fbm(vec2 p) {
+    float v = 0.0, a = 0.5;
+    mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+    for (int i = 0; i < 4; i++) {
+        v += a * gnoise(p);
+        p  = rot * p * 2.0;
+        a *= 0.5;
+    }
+    return v;
+}
+
+// ---- Schlick Fresnel -------------------------------------------------------
+float fresnelSchlick(float cosTheta) {
+    float F0 = 0.02;   // water IOR ≈ 1.33  →  F0 ≈ 0.02
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
 
 void main() {
-    // Discard fragments where the water has drained away
     if (WaterDepth < 0.03) discard;
-
-    // Depth-dependent colour (shallow → bright blue-green, deep → dark blue)
-    vec3 shallow = vec3(0.15, 0.55, 0.75);
-    vec3 deep    = vec3(0.02, 0.08, 0.35);
-    float df     = clamp(WaterDepth / 2.5, 0.0, 1.0);
-    vec3 base    = mix(shallow, deep, df);
 
     vec3 N = normalize(Normal);
     vec3 L = normalize(lightDir);
     vec3 V = normalize(viewPos - FragPos);
-    vec3 R = reflect(-L, N);
+    vec3 H = normalize(L + V);
 
-    // Phong-ish lighting
-    vec3  ambient  = 0.25 * base;
-    float diff     = max(dot(N, L), 0.0);
-    vec3  diffuse  = diff * base;
-    float spec     = pow(max(dot(V, R), 0.0), 128.0);
-    vec3  specular = 0.6 * spec * vec3(1.0, 0.95, 0.9);
+    // --- Detail normals (small animated ripples) --------------------------
+    vec2 uv1 = FragPos.xz * 1.8 + uTime * vec2( 0.04,  0.03);
+    vec2 uv2 = FragPos.xz * 3.2 + uTime * vec2(-0.03,  0.05);
+    vec3 detailN = vec3(
+        gnoise(uv1) * 0.12 + gnoise(uv2) * 0.06,
+        1.0,
+        gnoise(uv1.yx) * 0.12 + gnoise(uv2.yx) * 0.06
+    );
+    N = normalize(N + detailN * 0.25);
 
-    // Cheap Fresnel-like rim (more sky reflection at grazing angles)
-    float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    vec3  sky     = vec3(0.50, 0.70, 0.90);
-    vec3  refl    = mix(base, sky, fresnel * 0.4);
+    // --- Beer's-law absorption (exponential depth-based colouring) --------
+    vec3 absorb   = vec3(0.45, 0.08, 0.04);   // absorption coefficients (RGB)
+    vec3 scatter   = vec3(0.0, 0.02, 0.03);    // in-scattered light
+    vec3 deepColor = exp(-absorb * WaterDepth) + scatter * WaterDepth;
 
-    vec3  result = ambient + diffuse * 0.7 + specular + refl * 0.2;
-    float alpha  = clamp(WaterDepth / 0.3, 0.4, 0.92);
-    FragColor    = vec4(result, alpha);
+    vec3 shallow = vec3(0.22, 0.65, 0.72);
+    vec3 deep    = vec3(0.01, 0.06, 0.22);
+    float df     = clamp(WaterDepth / 2.5, 0.0, 1.0);
+    vec3 bodyColor = mix(shallow, deep, df) * deepColor;
+
+    // --- Fresnel ------------------------------------------------------------
+    float NdotV = max(dot(N, V), 0.0);
+    float F     = fresnelSchlick(NdotV);
+
+    // --- Reflection (environment approx) ------------------------------------
+    vec3 skyZenith  = vec3(0.30, 0.50, 0.85);
+    vec3 skyHorizon = vec3(0.60, 0.75, 0.95);
+    vec3 R_dir      = reflect(-V, N);
+    float skyFactor = clamp(R_dir.y, 0.0, 1.0);
+    vec3 envRefl    = mix(skyHorizon, skyZenith, skyFactor);
+
+    // Sun reflection highlight
+    float sunAngle = max(dot(R_dir, L), 0.0);
+    vec3  sunSpec  = vec3(1.0, 0.95, 0.85) * pow(sunAngle, 256.0) * 1.5;
+    envRefl += sunSpec;
+
+    // --- Blinn-Phong specular -----------------------------------------------
+    float NdotH = max(dot(N, H), 0.0);
+    float spec  = pow(NdotH, 256.0);
+    vec3 specular = vec3(1.0, 0.97, 0.90) * spec * 0.8;
+
+    // --- Subsurface scattering approximation --------------------------------
+    float sss = pow(clamp(dot(V, -L), 0.0, 1.0), 4.0);
+    vec3 sssColor = vec3(0.1, 0.5, 0.4) * sss * 0.3 * clamp(WaterDepth / 1.5, 0.0, 1.0);
+
+    // --- Diffuse lighting ----------------------------------------------------
+    float diff = max(dot(N, L), 0.0);
+    vec3 ambient = bodyColor * 0.2;
+
+    // --- Foam (at high-velocity regions: parting edges, wave crests) --------
+    float spd   = length(Velocity);
+    float foamT = smoothstep(2.5, 6.0, spd);
+    // Add noise-based foam breakup
+    float foamNoise = fbm(FragPos.xz * 3.0 + uTime * 0.5);
+    foamT *= smoothstep(-0.1, 0.4, foamNoise);
+    vec3 foamColor = vec3(0.90, 0.95, 1.0);
+
+    // --- Compose -------------------------------------------------------------
+    vec3 refracted = ambient + bodyColor * diff * 0.6 + sssColor;
+    vec3 waterSurf = mix(refracted, envRefl, F) + specular;
+    vec3 result    = mix(waterSurf, foamColor, foamT * 0.7);
+
+    // Alpha: opaque-ish for deep water; foam is always opaque
+    float alpha = clamp(WaterDepth / 0.2, 0.45, 0.93);
+    alpha = mix(alpha, 1.0, foamT * 0.6);
+
+    FragColor = vec4(result, alpha);
 }
 )";
 
@@ -137,7 +219,37 @@ in float Height;
 
 out vec4 FragColor;
 
-uniform vec3 lightDir;
+uniform vec3  lightDir;
+uniform float uTime;
+uniform float uWaterLevel;   // resting water surface Y
+
+// Simple hash for caustics
+vec2 hash22(vec2 p) {
+    p = vec2(dot(p, vec2(127.1, 311.7)),
+             dot(p, vec2(269.5, 183.3)));
+    return -1.0 + 2.0 * fract(sin(p) * 43758.5453);
+}
+float gnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(dot(hash22(i + vec2(0,0)), f - vec2(0,0)),
+                   dot(hash22(i + vec2(1,0)), f - vec2(1,0)), u.x),
+               mix(dot(hash22(i + vec2(0,1)), f - vec2(0,1)),
+                   dot(hash22(i + vec2(1,1)), f - vec2(1,1)), u.x), u.y);
+}
+float caustics(vec2 p, float t) {
+    float c = 0.0;
+    vec2 uv1 = p * 2.5 + t * vec2(0.08, 0.06);
+    vec2 uv2 = p * 3.7 + t * vec2(-0.06, 0.09);
+    vec2 uv3 = p * 5.1 + t * vec2(0.04, -0.07);
+    c += abs(gnoise(uv1));
+    c += abs(gnoise(uv2)) * 0.5;
+    c += abs(gnoise(uv3)) * 0.25;
+    // Sharpen into bright caustic lines
+    c = pow(c, 1.5) * 1.5;
+    return clamp(c, 0.0, 1.0);
+}
 
 void main() {
     // Sandy palette
@@ -148,9 +260,20 @@ void main() {
 
     vec3  N   = normalize(Normal);
     vec3  L   = normalize(lightDir);
-    float amb = 0.35;
+    float amb = 0.30;
     float dif = max(dot(N, L), 0.0);
-    FragColor = vec4((amb + dif * 0.65) * base, 1.0);
+    vec3 col = (amb + dif * 0.65) * base;
+
+    // Caustics — only visible when underwater (below water level)
+    if (FragPos.y < uWaterLevel - 0.05) {
+        float c = caustics(FragPos.xz, uTime);
+        // Stronger caustics in shallower water
+        float depthBelow = uWaterLevel - FragPos.y;
+        float cStrength  = clamp(1.0 - depthBelow / 3.0, 0.0, 1.0) * 0.35;
+        col += vec3(0.7, 0.85, 1.0) * c * cStrength * dif;
+    }
+
+    FragColor = vec4(col, 1.0);
 }
 )";
 
@@ -208,13 +331,14 @@ static void generateIndices(int Nx, int Nz, std::vector<unsigned int>& idx) {
         }
 }
 
-// Water vertex: pos(3) + normal(3) + depth(1)  = 7 floats
+// Water vertex: pos(3) + normal(3) + depth(1) + velocity(2) = 9 floats
+static const int WATER_STRIDE = 9;
+
 static void updateWaterMesh(const ShallowWater& sim, std::vector<float>& v) {
-    const int S = 7;
-    v.resize(sim.Nx * sim.Nz * S);
+    v.resize(sim.Nx * sim.Nz * WATER_STRIDE);
     for (int j = 0; j < sim.Nz; ++j)
         for (int i = 0; i < sim.Nx; ++i) {
-            int base = (j * sim.Nx + i) * S;
+            int base = (j * sim.Nx + i) * WATER_STRIDE;
             float x = sim.worldX(i);
             float y = sim.surfaceHeight(i, j);
             float z = sim.worldZ(j);
@@ -234,6 +358,8 @@ static void updateWaterMesh(const ShallowWater& sim, std::vector<float>& v) {
             v[base+0]=x;  v[base+1]=y;  v[base+2]=z;
             v[base+3]=nx; v[base+4]=ny; v[base+5]=nz;
             v[base+6]=depth;
+            v[base+7]=sim.velocityX(i, j);
+            v[base+8]=sim.velocityZ(i, j);
         }
 }
 
@@ -271,7 +397,7 @@ static void updateGroundMesh(const ShallowWater& sim, std::vector<float>& v) {
 //    1) Domain boundary skirts  (4 edges of the grid)
 //    2) Interior wet/dry edges  (the parting walls)
 //
-//  Each vertex: pos(3) + normal(3) + depth(1) = 7 floats  (same as water)
+//  Each vertex: pos(3) + normal(3) + depth(1) + velocity(2) = 9 floats  (same as water)
 // ============================================================================
 
 static void pushVert(std::vector<float>& v,
@@ -280,6 +406,7 @@ static void pushVert(std::vector<float>& v,
     v.push_back(x);  v.push_back(y);  v.push_back(z);
     v.push_back(nx); v.push_back(ny); v.push_back(nz);
     v.push_back(depth);
+    v.push_back(0.f); v.push_back(0.f);   // velocity = 0 for wall faces
 }
 
 // Add a vertical quad (two triangles).
@@ -289,7 +416,7 @@ static void addWallQuad(std::vector<float>& v, std::vector<unsigned int>& idx,
                         float x0, float z0, float y_top0, float d0,
                         float x1, float z1, float y_top1, float d1,
                         float nx, float ny, float nz, float y_bot) {
-    unsigned base = (unsigned)(v.size() / 7);
+    unsigned base = (unsigned)(v.size() / WATER_STRIDE);
     pushVert(v, x0, y_bot,   z0, nx, ny, nz, d0);  // 0  bottom-left
     pushVert(v, x1, y_bot,   z1, nx, ny, nz, d1);  // 1  bottom-right
     pushVert(v, x1, y_top1,  z1, nx, ny, nz, d1);  // 2  top-right
@@ -554,16 +681,20 @@ int main() {
                  indices.data(), GL_STATIC_DRAW);
 
     // layout(location=0) vec3 aPos
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7*sizeof(float), (void*)0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, WATER_STRIDE*sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
     // layout(location=1) vec3 aNormal
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 7*sizeof(float),
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, WATER_STRIDE*sizeof(float),
                           (void*)(3*sizeof(float)));
     glEnableVertexAttribArray(1);
     // layout(location=2) float aDepth
-    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 7*sizeof(float),
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, WATER_STRIDE*sizeof(float),
                           (void*)(6*sizeof(float)));
     glEnableVertexAttribArray(2);
+    // layout(location=3) vec2 aVelocity
+    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, WATER_STRIDE*sizeof(float),
+                          (void*)(7*sizeof(float)));
+    glEnableVertexAttribArray(3);
 
     // --- Ground mesh (VAO / VBO / EBO) --------------------------------------
     GLuint gVAO, gVBO, gEBO;
@@ -606,7 +737,7 @@ int main() {
     glBindVertexArray(wallVAO);
     glBindBuffer(GL_ARRAY_BUFFER, wallVBO);
     // Pre-allocate generous buffer (will grow as parting creates more walls)
-    size_t wallVertCap  = std::max(wallVerts.size(), (size_t)(GRID * 80 * 7));
+    size_t wallVertCap  = std::max(wallVerts.size(), (size_t)(GRID * 80 * WATER_STRIDE));
     size_t wallIdxCap   = std::max(wallIndices.size(), (size_t)(GRID * 80 * 6));
     glBufferData(GL_ARRAY_BUFFER,
                  (GLsizeiptr)(wallVertCap * sizeof(float)),
@@ -624,14 +755,17 @@ int main() {
                         (GLsizeiptr)(wallIndices.size() * sizeof(unsigned)),
                         wallIndices.data());
 
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7*sizeof(float), (void*)0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, WATER_STRIDE*sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 7*sizeof(float),
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, WATER_STRIDE*sizeof(float),
                           (void*)(3*sizeof(float)));
     glEnableVertexAttribArray(1);
-    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 7*sizeof(float),
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, WATER_STRIDE*sizeof(float),
                           (void*)(6*sizeof(float)));
     glEnableVertexAttribArray(2);
+    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, WATER_STRIDE*sizeof(float),
+                          (void*)(7*sizeof(float)));
+    glEnableVertexAttribArray(3);
 
     glBindVertexArray(0);
 
@@ -758,6 +892,8 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(groundProg,"view"), 1,GL_FALSE,glm::value_ptr(view));
         glUniformMatrix4fv(glGetUniformLocation(groundProg,"projection"),1,GL_FALSE,glm::value_ptr(proj));
         glUniform3fv(glGetUniformLocation(groundProg,"lightDir"),1,glm::value_ptr(lightDir));
+        glUniform1f(glGetUniformLocation(groundProg,"uTime"), app.totalTime);
+        glUniform1f(glGetUniformLocation(groundProg,"uWaterLevel"), WATER_H);
 
         glBindVertexArray(gVAO);
         glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT, 0);
@@ -772,6 +908,7 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(waterProg,"projection"),1,GL_FALSE,glm::value_ptr(proj));
         glUniform3fv(glGetUniformLocation(waterProg,"lightDir"),1,glm::value_ptr(lightDir));
         glUniform3fv(glGetUniformLocation(waterProg,"viewPos"), 1,glm::value_ptr(camPos));
+        glUniform1f(glGetUniformLocation(waterProg,"uTime"), app.totalTime);
 
         glBindVertexArray(wVAO);
         glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT, 0);
