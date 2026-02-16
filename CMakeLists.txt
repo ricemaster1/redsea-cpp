@@ -28,12 +28,26 @@ FetchContent_MakeAvailable(glm)
 # ---- OpenGL ----
 find_package(OpenGL REQUIRED)
 
+# ---- GLEW (GL loader — Linux/Windows only) ----
+if(NOT APPLE)
+    find_package(GLEW REQUIRED)
+endif()
+
 # ---- Executable ----
 add_executable(redsea src/main.cpp)
 target_include_directories(redsea PRIVATE src)
 target_link_libraries(redsea PRIVATE glfw glm::glm OpenGL::GL)
 
-# Silence Apple's OpenGL deprecation warnings
 if(APPLE)
+    # Silence Apple's OpenGL deprecation warnings
     target_compile_definitions(redsea PRIVATE GL_SILENCE_DEPRECATION)
+else()
+    target_link_libraries(redsea PRIVATE GLEW::GLEW)
+    target_compile_definitions(redsea PRIVATE USE_GLEW)
+endif()
+
+# Release optimisations
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(redsea PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-O3 -march=native -ffast-math>)
 endif()

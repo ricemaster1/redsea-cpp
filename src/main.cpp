@@ -13,14 +13,15 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 
 // --- OpenGL headers ---------------------------------------------------------
 #ifdef __APPLE__
     #include <OpenGL/gl3.h>          // macOS ships GL 3.3–4.1 in the framework
+#elif defined(USE_GLEW)
+    #include <GL/glew.h>
 #else
-    // On Linux / Windows you would include GLAD here instead:
-    // #include <glad/glad.h>
     #include <GL/gl.h>
 #endif
 
@@ -625,6 +626,16 @@ int main() {
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);                                    // VSync
 
+#ifdef USE_GLEW
+    glewExperimental = GL_TRUE;
+    GLenum glewErr = glewInit();
+    if (glewErr != GLEW_OK) {
+        std::cerr << "GLEW init failed: " << glewGetErrorString(glewErr) << '\n';
+        glfwTerminate();
+        return 1;
+    }
+#endif
+
     glfwSetFramebufferSizeCallback(window, fbCallback);
     glfwSetKeyCallback            (window, keyCallback);
     glfwSetMouseButtonCallback    (window, mbCallback);
@@ -825,18 +836,26 @@ int main() {
             }
         }
 
-        // Upload updated meshes to GPU
+        // Upload updated meshes to GPU (orphan + map to avoid sync stalls)
         updateWaterMesh(sim, waterVerts);
-        glBindBuffer(GL_ARRAY_BUFFER, wVBO);
-        glBufferSubData(GL_ARRAY_BUFFER, 0,
-                        (GLsizeiptr)(waterVerts.size() * sizeof(float)),
-                        waterVerts.data());
+        {
+            GLsizeiptr sz = (GLsizeiptr)(waterVerts.size() * sizeof(float));
+            glBindBuffer(GL_ARRAY_BUFFER, wVBO);
+            glBufferData(GL_ARRAY_BUFFER, sz, nullptr, GL_STREAM_DRAW); // orphan
+            void* ptr = glMapBufferRange(GL_ARRAY_BUFFER, 0, sz,
+                GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            if (ptr) { memcpy(ptr, waterVerts.data(), sz); glUnmapBuffer(GL_ARRAY_BUFFER); }
+        }
 
         updateGroundMesh(sim, groundVerts);
-        glBindBuffer(GL_ARRAY_BUFFER, gVBO);
-        glBufferSubData(GL_ARRAY_BUFFER, 0,
-                        (GLsizeiptr)(groundVerts.size() * sizeof(float)),
-                        groundVerts.data());
+        {
+            GLsizeiptr sz = (GLsizeiptr)(groundVerts.size() * sizeof(float));
+            glBindBuffer(GL_ARRAY_BUFFER, gVBO);
+            glBufferData(GL_ARRAY_BUFFER, sz, nullptr, GL_STREAM_DRAW);
+            void* ptr = glMapBufferRange(GL_ARRAY_BUFFER, 0, sz,
+                GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            if (ptr) { memcpy(ptr, groundVerts.data(), sz); glUnmapBuffer(GL_ARRAY_BUFFER); }
+        }
 
         // Update wall mesh (may grow as parting creates more wet/dry edges)
         updateWallMesh(sim, wallVerts, wallIndices);
